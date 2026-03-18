@@ -1,0 +1,23 @@
+# Python environments
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# IDEs and Tools
+.vscode/
+.idea/
+.DS_Store
+
+# Data, Logs, and App Storage
+storage/logs/*.jsonl
+storage/memory/*.db
+storage/uploads/*
+storage/vector_store/*.faiss
+storage/vector_store/*.pkl
+
+# Ignore sensitive reports
+*.docx
+tl_progress_report.md
