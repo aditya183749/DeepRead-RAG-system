@@ -193,60 +193,146 @@ def render_sidebar():
 
         st.divider()
 
-        # ── Uploaded Documents List ────────────────────────────────────────
-        st.subheader("📚 Uploaded Documents")
+        # ── Uploaded Documents List (DLM-aware) ───────────────────────────
+        st.subheader("📚 Documents")
 
-        # Refresh sources from backend on each render
-        # (st.cache_data would skip re-fetch, but we want live updates)
-        sources = api_client.get_sources()
-        st.session_state.sources = sources
+        # Load lifecycle-aware document list
+        doc_groups = api_client.get_documents()
 
-        if not sources:
+        if not doc_groups:
             st.caption("No documents uploaded yet.")
         else:
-            st.caption("Check one or more documents to chat across them:")
+            st.caption("Select active documents to chat across them:")
             new_selection = []
-            for source in sources:
-                is_checked = source["source_id"] in st.session_state.selected_source_ids
-                label = f"📄 {source['filename']} ({source['chunk_count']} chunks)"
-                checked = st.checkbox(label, value=is_checked, key=f"chk_{source['source_id']}")
-                if checked:
-                    new_selection.append(source["source_id"])
 
-                # 🖼️ Analyze Images button — only for PDFs
-                if source["filename"].lower().endswith(".pdf"):
-                    if st.button(
-                        "🖼️ Analyze Images",
-                        key=f"img_{source['source_id']}",
-                        help="Use LLaVA to describe charts, figures, and image-heavy pages",
-                        use_container_width=True
-                    ):
-                        img_box = st.empty()
-                        img_lines = []
-                        for event in api_client.analyze_images_stream(source["source_id"]):
-                            ev_type = event.get("type")
-                            if ev_type == "progress":
-                                icon = {"scanning": "🔍", "found": "📋", "analyzing": "🧠",
-                                        "indexed": "✅", "indexing": "🗂️", "skipped": "⚠️"}.get(
-                                    event.get("step", ""), "⏳")
-                                img_lines.append(f"{icon} {event.get('detail', '')}")
-                                img_box.markdown("\n\n".join(f"`{l}`" for l in img_lines))
-                            elif ev_type == "complete":
-                                found = event.get("images_found", 0)
-                                indexed = event.get("descriptions_indexed", 0)
-                                if found == 0:
-                                    img_box.info("ℹ️ No image-heavy pages found in this PDF.")
-                                else:
-                                    img_lines.append(f"🎉 Done — {indexed} pages described and indexed!")
-                                    img_box.markdown("\n\n".join(f"`{l}`" for l in img_lines))
-                                    st.success(f"✅ {indexed} image pages indexed — you can now ask questions about them!")
-                            elif ev_type == "error":
-                                img_box.error(f"❌ {event.get('detail', 'Analysis failed')}")
+            for group in doc_groups:
+                versions   = group.get("versions", [])
+                active_ver = next((v for v in versions if v["status"] == "active"), None)
+                other_vers = [v for v in versions if v["status"] != "active"]
 
-            # If selection changed, clear chat and update state
+                if active_ver:
+                    source_id  = active_ver["source_id"]
+                    is_checked = source_id in st.session_state.selected_source_ids
+                    label = (
+                        f"📄 {active_ver['filename']}  "
+                        f"**v{active_ver['version']}** ✅"
+                    )
+                    checked = st.checkbox(label, value=is_checked, key=f"chk_{source_id}")
+                    if checked:
+                        new_selection.append(source_id)
+
+                    # Action buttons row
+                    col_img, col_arc = st.columns(2)
+
+                    # 🖼️ Analyze Images — only for PDFs
+                    with col_img:
+                        if active_ver["filename"].lower().endswith(".pdf"):
+                            if st.button("🖼️ Images", key=f"img_{source_id}",
+                                         help="Analyze charts/figures with LLaVA",
+                                         use_container_width=True):
+                                img_box   = st.empty()
+                                img_lines = []
+                                for event in api_client.analyze_images_stream(source_id):
+                                    ev_type = event.get("type")
+                                    if ev_type == "progress":
+                                        icon = {"scanning":"🔍","found":"📋","analyzing":"🧠",
+                                                "indexed":"✅","indexing":"🗂️","skipped":"⚠️"}.get(
+                                            event.get("step",""), "⏳")
+                                        img_lines.append(f"{icon} {event.get('detail','')}")
+                                        img_box.markdown("\n\n".join(f"`{l}`" for l in img_lines))
+                                    elif ev_type == "complete":
+                                        indexed = event.get("descriptions_indexed", 0)
+                                        if event.get("images_found", 0) == 0:
+                                            img_box.info("ℹ️ No image-heavy pages found.")
+                                        else:
+                                            img_lines.append(f"🎉 Done — {indexed} pages indexed!")
+                                            img_box.markdown("\n\n".join(f"`{l}`" for l in img_lines))
+                                            st.success(f"✅ {indexed} image pages indexed!")
+                                    elif ev_type == "error":
+                                        img_box.error(f"❌ {event.get('detail','Analysis failed')}")
+
+                    # 📦 Archive button
+                    with col_arc:
+                        if st.button("📦 Archive", key=f"arc_{source_id}",
+                                     help="Hide this document from search (keeps history)",
+                                     use_container_width=True):
+                            try:
+                                api_client.set_document_status(source_id, "archived",
+                                                               notes="Manually archived by user")
+                                st.success("📦 Document archived.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
+                    # Version history expander
+                    if other_vers:
+                        with st.expander(f"🕓 {len(other_vers)} older version(s)"):
+                            for ov in other_vers:
+                                status_icon = "📦" if ov["status"] == "archived" else "⏳"
+                                st.caption(
+                                    f"{status_icon} **v{ov['version']}** — "
+                                    f"{ov['filename']} · {ov['chunk_count']} chunks · "
+                                    f"{ov['uploaded_at'][:10]}"
+                                )
+                                col_r, col_d = st.columns(2)
+                                with col_r:
+                                    if st.button("♻️ Restore", key=f"rst_{ov['source_id']}",
+                                                 use_container_width=True):
+                                        try:
+                                            api_client.set_document_status(ov["source_id"], "active")
+                                            api_client.set_document_status(source_id, "archived")
+                                            st.success("♻️ Version restored!")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"❌ {e}")
+                                with col_d:
+                                    if st.button("🔍 See Changes", key=f"diff_{ov['source_id']}",
+                                                 use_container_width=True):
+                                        try:
+                                            diff = api_client.get_version_diff(ov["source_id"], source_id)
+                                            st.session_state[f"diff_{ov['source_id']}"] = diff
+                                        except Exception as e:
+                                            st.error(f"❌ {e}")
+
+                                # Show diff result if available
+                                diff_key = f"diff_{ov['source_id']}"
+                                if diff_key in st.session_state:
+                                    d = st.session_state[diff_key]
+                                    st.info(
+                                        f"📊 **v{d['old_version']['version']} → v{d['new_version']['version']}**: "
+                                        f"🟢 +{d['added_chunks']} added · "
+                                        f"🔴 -{d['removed_chunks']} removed · "
+                                        f"⚪ {d['unchanged_chunks']} unchanged"
+                                    )
+                                    if d.get("diff_summary"):
+                                        with st.expander("View sample changes"):
+                                            for line in d["diff_summary"][:6]:
+                                                color = "green" if line.startswith("+") else "red"
+                                                st.markdown(f":{color}[{line[:120]}]")
+
+                elif versions:
+                    # All versions archived — show collapsed
+                    with st.expander(f"📦 {group['display_name']} (all archived)"):
+                        for ov in versions:
+                            st.caption(
+                                f"📦 v{ov['version']} · {ov['chunk_count']} chunks · "
+                                f"{ov['uploaded_at'][:10]}"
+                            )
+                            if st.button("♻️ Restore", key=f"rst_all_{ov['source_id']}",
+                                         use_container_width=True):
+                                try:
+                                    api_client.set_document_status(ov["source_id"], "active")
+                                    st.success("♻️ Restored!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ {e}")
+
+            # Update selection and refresh sources list for compatibility
             if set(new_selection) != set(st.session_state.selected_source_ids):
                 st.session_state.selected_source_ids = new_selection
                 st.session_state.messages = []
+            # Keep backward compat: also populate st.session_state.sources
+            st.session_state.sources = api_client.get_sources()
 
 
         st.divider()
@@ -256,7 +342,8 @@ def render_sidebar():
 
         # Summarize works on ONE doc — use the first selected doc
         summarize_source_id = st.session_state.selected_source_ids[0] if st.session_state.selected_source_ids else None
-        summarize_filename = next((s["filename"] for s in sources if s["source_id"] == summarize_source_id), None) if summarize_source_id else None
+        _sources_for_summ   = st.session_state.get("sources", [])
+        summarize_filename  = next((s["filename"] for s in _sources_for_summ if s["source_id"] == summarize_source_id), None) if summarize_source_id else None
 
         if summarize_source_id:
             st.caption(f"Summarizing: **{summarize_filename}**")

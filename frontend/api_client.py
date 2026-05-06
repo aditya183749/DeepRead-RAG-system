@@ -288,3 +288,57 @@ def delete_source(source_id: str) -> Dict[str, Any]:
         raise Exception(f"Delete failed ({response.status_code}): {error_detail}")
     except httpx.ConnectError:
         raise Exception("Backend not reachable. Is it running on port 8000?")
+
+
+# ─── Document Lifecycle Management ────────────────────────────────────────────
+
+def get_documents(active_only: bool = False) -> List[Dict[str, Any]]:
+    """
+    GET /documents — returns all document versions grouped by doc_key.
+    Each group has 'doc_key', 'display_name', and 'versions' list.
+    """
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.get(
+                f"{API_BASE_URL}/documents",
+                params={"active_only": str(active_only).lower()}
+            )
+        if response.status_code == 200:
+            return response.json().get("documents", [])
+        return []
+    except Exception:
+        return []
+
+
+def set_document_status(source_id: str, status: str, notes: str = "") -> Dict[str, Any]:
+    """
+    PATCH /documents/{source_id}/status — archive, expire, or restore a version.
+    status: 'active' | 'archived' | 'expired'
+    """
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.patch(
+                f"{API_BASE_URL}/documents/{source_id}/status",
+                params={"status": status, "notes": notes}
+            )
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(response.json().get("detail", "Status update failed"))
+    except httpx.ConnectError:
+        raise Exception("Backend not reachable.")
+
+
+def get_version_diff(source_id_old: str, source_id_new: str) -> Dict[str, Any]:
+    """
+    GET /documents/{old}/{new}/diff — chunk-level diff between two document versions.
+    """
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.get(
+                f"{API_BASE_URL}/documents/{source_id_old}/{source_id_new}/diff"
+            )
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(response.json().get("detail", "Diff failed"))
+    except httpx.ConnectError:
+        raise Exception("Backend not reachable.")

@@ -11,6 +11,7 @@ WHY THIS FILE EXISTS:
 """
 
 import json
+import time
 from typing import List, Dict, Any, Generator
 
 import ollama
@@ -119,11 +120,19 @@ def stream_rag_answer(
         # Emit real token counts from Ollama's final chunk
         # eval_count = output tokens, prompt_eval_count = input tokens
         if last_chunk:
+            eval_count     = last_chunk.get("eval_count", 0)            # completion tokens
+            prompt_count   = last_chunk.get("prompt_eval_count", 0)     # input tokens
+            # eval_duration is in nanoseconds — convert to seconds for tokens/sec
+            eval_duration_ns  = last_chunk.get("eval_duration", 0)
+            tokens_per_second = round((eval_count / (eval_duration_ns / 1e9)), 2) if eval_duration_ns > 0 else 0.0
+
             usage_event = json.dumps({
-                "type": "usage",
-                "prompt_tokens":     last_chunk.get("prompt_eval_count", 0),
-                "completion_tokens": last_chunk.get("eval_count", 0),
-                "total_tokens":      last_chunk.get("prompt_eval_count", 0) + last_chunk.get("eval_count", 0),
+                "type":              "usage",
+                "prompt_tokens":     prompt_count,
+                "completion_tokens": eval_count,
+                "total_tokens":      prompt_count + eval_count,
+                "tokens_per_second": tokens_per_second,
+                "eval_duration_ms":  round(eval_duration_ns / 1e6, 1) if eval_duration_ns else 0,
             })
             yield f"data: {usage_event}\n\n"
 

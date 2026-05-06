@@ -185,12 +185,37 @@ def rerank_chunks(
     latency_ms = (time.perf_counter() - t0) * 1000
     n_out = len(clean)
 
+    # ── Score Distribution Stats ────────────────────────────────────────────────
+    all_scores = [c["rerank_score"] for c in scored] if scored else []
+    out_scores = [c["rerank_score"] for c in clean] if clean else []
+
+    def _stats(vals):
+        if not vals:
+            return {}
+        arr = sorted(vals)
+        n   = len(arr)
+        return {
+            "min":    round(arr[0], 3),
+            "max":    round(arr[-1], 3),
+            "mean":   round(sum(arr) / n, 3),
+            "median": round(arr[n // 2], 3),
+            "p25":    round(arr[n // 4], 3),
+            "p75":    round(arr[(3 * n) // 4], 3),
+        }
+
     log.info("rerank_complete",
         query=query[:80],
         chunks_in=n_in,
         chunks_out=n_out,
         top_score=round(clean[0]["rerank_score"], 3) if clean else None,
-        latency_ms=round(latency_ms, 1)
+        latency_ms=round(latency_ms, 1),
+        # Reranker score distribution — all candidates
+        score_distribution_all=_stats(all_scores),
+        # Score distribution — only the chunks that passed the filter
+        score_distribution_kept=_stats(out_scores),
+        # Hit detection: did any chunk score above threshold?
+        retrieval_hit=any(s > MIN_RERANK_SCORE for s in all_scores),
+        chunks_below_threshold=sum(1 for s in all_scores if s <= MIN_RERANK_SCORE),
     )
 
     return clean

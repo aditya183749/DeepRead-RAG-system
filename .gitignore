@@ -13,10 +13,15 @@ __pycache__/
 
 # Data, Logs, and App Storage
 storage/logs/*.jsonl
-storage/memory/*.db
 storage/uploads/*
-storage/vector_store/*.faiss
-storage/vector_store/*.pkl
+
+# Binary indexes (regenerated on first upload — do not commit)
+storage/faiss/*.index
+storage/faiss/*.pkl
+storage/bm25/*.pkl
+
+# SQLite database (user session data — do not commit)
+storage/sessions.db
 
 # Ignore sensitive reports
 *.docx

@@ -58,6 +58,7 @@ from retrieval.query_rewriter import rewrite_query
 from logger import configure_logging, get_logger
 import memory.db as mem_db
 from memory.stm import build_stm_block, should_summarize
+from lifecycle import compare_versions
 
 log          = get_logger("app")
 log_sessions = get_logger("sessions")
@@ -139,6 +140,7 @@ def _full_retrieval(
     t0 = time.perf_counter()
 
     # ── Step 1: Rewrite ───────────────────────────────────────────────────────
+    t_rewrite_start = time.perf_counter()
     if rewrite:
         rw = rewrite_query(question)
         query_type   = rw.query_type
@@ -150,9 +152,10 @@ def _full_retrieval(
         query_type = "factual"
         variants   = [question]
         display_q  = question
+    rewrite_ms = round((time.perf_counter() - t_rewrite_start) * 1000, 1)
 
     # ── Step 2: Multi-variant hybrid search ───────────────────────────────────
-    # Retrieve for each variant and HyDE, then merge
+    t_retrieval_start = time.perf_counter()
     all_chunks: dict[str, dict] = {}
 
     # HyDE embedding retrieval (most powerful)
@@ -167,18 +170,27 @@ def _full_retrieval(
                 all_chunks[chunk["text"]] = chunk
 
     candidate_chunks = list(all_chunks.values())
+    retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 1)
 
     # ── Step 3: Re-rank + noise filter ────────────────────────────────────────
+    t_rerank_start = time.perf_counter()
     reranked = rerank_chunks(
         query=display_q,
         chunks=candidate_chunks,
         top_n=TOP_K_RESULTS
     )
+    rerank_ms = round((time.perf_counter() - t_rerank_start) * 1000, 1)
 
     # ── Step 4: STM context assembly ──────────────────────────────────────────
+    t_assembly_start = time.perf_counter()
     context_block, final_chunks = assemble_context(reranked)
+    assembly_ms = round((time.perf_counter() - t_assembly_start) * 1000, 1)
 
     total_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    # Retrieval hit rate signal: did at least 1 chunk pass reranking threshold?
+    retrieval_hit = len(reranked) > 0
+
     log.info("retrieval_pipeline_complete",
         query_id=query_id,
         original_query=question,
@@ -187,7 +199,14 @@ def _full_retrieval(
         candidates=len(candidate_chunks),
         after_rerank=len(reranked),
         final=len(final_chunks),
-        total_latency_ms=total_ms
+        retrieval_hit=retrieval_hit,
+        latency_breakdown_ms={
+            "rewrite":   rewrite_ms,
+            "retrieval": retrieval_ms,
+            "reranking": rerank_ms,
+            "assembly":  assembly_ms,
+            "total":     total_ms
+        }
     )
 
     return final_chunks, context_block, query_type
@@ -285,6 +304,14 @@ async def upload_file(file: UploadFile = File(...)):
             )
             final_path = UPLOAD_DIR / f"{source_id}_{_fname}"
             temp_path.rename(final_path)
+            # Register in document lifecycle management
+            file_size = final_path.stat().st_size
+            mem_db.register_document(
+                source_id=source_id,
+                filename=_fname,
+                chunk_count=chunk_count,
+                file_size=file_size,
+            )
             log.info("upload_success", filename=_fname,
                      source_id=source_id, chunks=chunk_count, pages=page_count)
             _loop.call_soon_threadsafe(_queue.put_nowait, {
@@ -419,6 +446,7 @@ async def chat(request: ChatRequest):
         full_response_parts = []
         real_prompt_tokens     = 0
         real_completion_tokens = 0
+        real_tokens_per_sec    = 0.0
         import json as _json
         yield f"data: {_json.dumps({'type': 'session_id', 'session_id': session_id})}\n\n"
 
@@ -437,6 +465,7 @@ async def chat(request: ChatRequest):
                     # Real token counts from Ollama — not estimates
                     real_prompt_tokens     = ev.get("prompt_tokens", 0)
                     real_completion_tokens = ev.get("completion_tokens", 0)
+                    real_tokens_per_sec    = ev.get("tokens_per_second", 0.0)
             except Exception:
                 pass
             yield chunk_event
@@ -446,13 +475,32 @@ async def chat(request: ChatRequest):
         if full_response:
             mem_db.append_message(session_id, "assistant", full_response)
             total_ms = round((time.perf_counter() - query_start_time) * 1000, 1)
+
+            # ── Source Grounding %: fraction of sentences that cite a source ─
+            import re as _re
+            sentences = [s.strip() for s in _re.split(r'[.!?]', full_response) if s.strip()]
+            grounded  = [s for s in sentences if "[SOURCE" in s or "[Page" in s or "[" in s]
+            source_grounding_pct = round(len(grounded) / len(sentences) * 100, 1) if sentences else 0.0
+
+            # ── Hallucination Flag: did the LLM refuse due to missing context? ─
+            REFUSAL_PHRASES = [
+                "could not find", "cannot find", "not found in",
+                "no information", "insufficient information",
+                "not provided in", "not mentioned in"
+            ]
+            lower_resp = full_response.lower()
+            hallucination_flagged = any(p in lower_resp for p in REFUSAL_PHRASES)
+
             log_tokens.info("response_tokens",
                 session_id=session_id,
                 stage="llm_response",
-                prompt_tokens=real_prompt_tokens or total_input_tokens,   # fallback to estimate
+                prompt_tokens=real_prompt_tokens or total_input_tokens,
                 completion_tokens=real_completion_tokens or len(full_response.split()),
+                tokens_per_second=real_tokens_per_sec,
                 source="ollama" if real_prompt_tokens else "estimated",
-                total_latency_ms=total_ms
+                total_latency_ms=total_ms,
+                source_grounding_pct=source_grounding_pct,
+                hallucination_flagged=hallucination_flagged,
             )
             log_sessions.info("query_end",
                 session_id=session_id,
@@ -460,8 +508,12 @@ async def chat(request: ChatRequest):
                 total_latency_ms=total_ms,
                 input_tokens=real_prompt_tokens or total_input_tokens,
                 output_tokens=real_completion_tokens or len(full_response.split()),
-                chunks_used=len(final_chunks)
+                tokens_per_second=real_tokens_per_sec,
+                chunks_used=len(final_chunks),
+                source_grounding_pct=source_grounding_pct,
+                hallucination_flagged=hallucination_flagged,
             )
+
 
         # Trigger summary if session is long
         if should_summarize(session_id):
@@ -597,14 +649,20 @@ async def analyze_images(request: SummarizeRequest):
 
                 try:
                     resp = client.chat(
-                        model="llava:7b",
+                        model="llava",
                         messages=[{
                             "role": "user",
                             "content": (
-                                "Describe this document page in detail. "
-                                "Include all text you can read, describe all charts, "
-                                "graphs, tables, figures, and diagrams accurately. "
-                                "Be thorough — this description will be used to answer questions."
+                                "You are a document data extraction assistant. Analyze this page carefully and extract ALL information.\n\n"
+                                "IMPORTANT RULES:\n"
+                                "1. If there is a CHART or GRAPH: List EVERY data point you can read. "
+                                "Example: 'January: 1200 units, February: 1500 units, March: 1700 units'. "
+                                "State the chart title, axis labels (X-axis, Y-axis), and ALL visible values.\n"
+                                "2. If there is a TABLE: Extract every row and column value verbatim.\n"
+                                "3. If there is TEXT: Transcribe it exactly.\n"
+                                "4. If there are FIGURES or DIAGRAMS: Describe every element in detail.\n\n"
+                                "Be THOROUGH and PRECISE. Include all numbers, dates, labels, percentages, and categories. "
+                                "Your response will be used to answer specific data questions, so completeness is critical."
                             ),
                             "images": [img_b64]
                         }]
@@ -726,6 +784,77 @@ async def delete_source(source_id: str):
 
     log.info("document_deleted", source_id=source_id, chunks_removed=faiss_deleted)
     return {"status": "deleted", "source_id": source_id, "chunks_removed": faiss_deleted}
+
+
+# ─── GET /documents ────────────────────────────────────────────────────────────
+
+@app.get("/documents")
+async def get_documents(active_only: bool = False):
+    """
+    List all document versions with lifecycle metadata.
+    Grouped by doc_key so version history is visible.
+    ?active_only=true returns only currently active versions.
+    """
+    rows = mem_db.get_active_documents() if active_only else mem_db.get_all_documents()
+
+    # Group by doc_key
+    grouped: dict = {}
+    for row in rows:
+        key = row["doc_key"]
+        if key not in grouped:
+            grouped[key] = {
+                "doc_key":     key,
+                "display_name": row["display_name"],
+                "versions":    []
+            }
+        grouped[key]["versions"].append({
+            "source_id":   row["source_id"],
+            "filename":    row["filename"],
+            "version":     row["version"],
+            "status":      row["status"],
+            "chunk_count": row["chunk_count"],
+            "file_size":   row["file_size"],
+            "uploaded_at": row["uploaded_at"],
+            "archived_at": row.get("archived_at"),
+            "notes":       row.get("notes"),
+        })
+
+    return {"documents": list(grouped.values()), "total": len(grouped)}
+
+
+# ─── PATCH /documents/{source_id}/status ──────────────────────────────────────
+
+@app.patch("/documents/{source_id}/status")
+async def update_document_status(source_id: str, status: str, notes: str = ""):
+    """
+    Update a document version's lifecycle status.
+    status: 'active' | 'archived' | 'expired'
+    """
+    valid = {"active", "archived", "expired"}
+    if status not in valid:
+        raise HTTPException(status_code=400,
+            detail=f"Invalid status '{status}'. Must be one of: {valid}")
+
+    ok = mem_db.set_document_status(source_id, status, notes or None)
+    if not ok:
+        raise HTTPException(status_code=404,
+            detail=f"No document found with source_id '{source_id}'.")
+
+    return {"status": "updated", "source_id": source_id, "new_status": status}
+
+
+# ─── GET /documents/{old_source_id}/{new_source_id}/diff ──────────────────────
+
+@app.get("/documents/{source_id_old}/{source_id_new}/diff")
+async def get_version_diff(source_id_old: str, source_id_new: str):
+    """
+    Compare chunks between two document versions.
+    Returns added/removed/unchanged chunk counts + a brief diff summary.
+    """
+    result = compare_versions(source_id_old, source_id_new)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 # ─── GET /sessions ────────────────────────────────────────────────────────────
